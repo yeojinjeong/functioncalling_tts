@@ -1,0 +1,146 @@
+import os
+import json
+import uuid
+import requests
+import streamlit as st
+from dotenv import load_dotenv
+from pydub import AudioSegment  # 병합을 위한 라이브러리
+
+# 환경 변수 로드
+load_dotenv()
+HCX_API_KEY = os.getenv("HCX_API_KEY")
+NAVER_CLIENT_ID = os.getenv("NAVER_CLIENT_ID")
+NAVER_CLIENT_SECRET = os.getenv("NAVER_CLIENT_SECRET")
+MODEL_NAME = "HCX-DASH-002"
+BASE_URL = f"https://clovastudio.stream.ntruss.com/testapp/v3/chat-completions/{MODEL_NAME}"
+
+# 지원 가능한 TTS 화자 목록
+SPEAKERS = [
+    "ndaeseong", "ndain", "ndonghyun", "nes_c_hyeri", "nes_c_kihyo",
+    "nes_c_mikyung", "nes_c_sohyun", "neunseo", "neunwoo"
+]
+
+# HCX Function Calling 호출 함수
+def send_hcx_function_calling(messages, functions=None, temperature=0.7, top_p=0.9, max_tokens=512):
+    headers = {
+        "Authorization": f"Bearer {HCX_API_KEY}",
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "messages": messages,
+        "functions": functions or [],
+        "function_call": "auto",
+        "seed": 0,
+        "topP": top_p,
+        "topK": 0,
+        "maxTokens": max_tokens,
+        "temperature": temperature,
+        "repeatPenalty": 1.1,
+        "stopBefore": []
+    }
+    resp = requests.post(BASE_URL, headers=headers, json=payload)
+    resp.raise_for_status()
+    return resp.json()
+
+# 팟캐스트 스크립트 생성 함수
+def generate_script(topic):
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "generate_script",
+                "description": "주제 기반으로 짧은 팟캐스트 대본을 생성합니다. 대본은 발화자 2명으로만 구성해서 생성. 대본 형식으로 출력하기",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"topic": {"type": "string", "description": "팟캐스트 주제"}},
+                    "required": ["topic"]
+                }
+            }
+        }
+    ]
+    messages = [
+        {"role": "system", "content": "팟캐스트 대본 생성기"},
+        {"role": "user", "content": topic}
+    ]
+    resp = send_hcx_function_calling(messages, functions=tools)
+    return resp.get("result", {}).get("message", {}).get("content", "")
+
+# TTS API 호출 함수
+def generate_tts(text, speaker, speed=0):
+    url = "https://naveropenapi.apigw.ntruss.com/tts-premium/v1/tts"
+    headers = {
+        "X-NCP-APIGW-API-KEY-ID": NAVER_CLIENT_ID,
+        "X-NCP-APIGW-API-KEY": NAVER_CLIENT_SECRET,
+        "Content-Type": "application/x-www-form-urlencoded"
+    }
+    data = {"speaker": speaker, "speed": str(speed), "format": "mp3", "text": text}
+    r = requests.post(url, headers=headers, data=data)
+    r.raise_for_status()
+    filename = f"tts_{speaker}_{uuid.uuid4().hex[:6]}.mp3"
+    with open(filename, "wb") as f:
+        f.write(r.content)
+    return filename
+
+# 오디오 병합 함수
+def merge_audio_files(mp3_paths, output_path="final_podcast.mp3"):
+    combined = AudioSegment.empty()
+    for path in mp3_paths:
+        audio = AudioSegment.from_file(path, format="mp3")
+        combined += audio
+    combined.export(output_path, format="mp3")
+    return output_path
+
+# Streamlit UI
+st.set_page_config(page_title="🎙️ 팟캐스트 생성 & TTS", layout="centered")
+st.title("🎙️ HyperCLOVA X 팟캐스트 제작기")
+
+# 입력
+topic = st.text_input("팟캐스트 주제를 입력하세요:")
+selected_speakers = st.multiselect(
+    "TTS 목소리 두 개를 선택하세요:",
+    options=SPEAKERS,
+    default=SPEAKERS[:2],
+    help="리스트에서 두 개의 화자를 선택하세요"
+)
+
+if topic:
+    if len(selected_speakers) != 2:
+        st.error("화자를 정확히 두 명 선택해야 합니다.")
+    else:
+        with st.spinner("스크립트 생성 중..."):
+            try:
+                script = generate_script(topic)
+            except Exception as e:
+                st.error(f"스크립트 생성 오류: {e}")
+                st.stop()
+        st.subheader("생성된 팟캐스트 대본")
+        st.text(script)
+
+        lines = [line.strip() for line in script.splitlines() if line.strip()]
+        audio_files = []
+        for idx, line in enumerate(lines):
+            _, utter = line.split(":", 1) if ":" in line else (None, line)
+            speaker = selected_speakers[idx % 2]
+            try:
+                path = generate_tts(utter, speaker=speaker)
+                audio_files.append((speaker, path))
+            except Exception as e:
+                st.error(f"TTS 변환 오류 (라인 {idx+1}): {e}")
+
+        # 개별 오디오 출력
+        st.subheader("생성된 팟캐스트 음성")
+        for i, (spk, fpath) in enumerate(audio_files, 1):
+            st.markdown(f"**Segment {i} ({spk})**")
+            with open(fpath, "rb") as f:
+                st.audio(f.read(), format="audio/mp3")
+
+        # 병합된 오디오 출력
+        try:
+            st.subheader("🎧 병합된 전체 팟캐스트 오디오")
+            merged_path = merge_audio_files([f for _, f in audio_files])
+            with open(merged_path, "rb") as f:
+                merged_audio = f.read()
+                st.audio(merged_audio, format="audio/mp3")
+                st.download_button("📥 병합된 오디오 다운로드", merged_audio, file_name=merged_path)
+        except Exception as e:
+            st.error(f"병합 오류: {e}")
